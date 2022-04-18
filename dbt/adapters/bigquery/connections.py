@@ -3,6 +3,8 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
+from time import perf_counter
+
 import agate
 from requests.exceptions import ConnectionError
 from typing import Optional, Any, Dict, Tuple
@@ -54,6 +56,20 @@ RETRYABLE_ERRORS = (
     ConnectionResetError,
     ConnectionError,
 )
+
+
+class catchtime:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.time = perf_counter()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.time = perf_counter() - self.time
+        self.readout = f"BENCHMARK LOG (adapter) - {self.name} - Time: {self.time:.3f} seconds"
+        print(self.readout)
 
 
 @lru_cache()
@@ -306,20 +322,22 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
     @classmethod
     def get_bigquery_client(cls, profile_credentials):
-        if profile_credentials.impersonate_service_account:
-            creds = cls.get_impersonated_bigquery_credentials(profile_credentials)
-        else:
-            creds = cls.get_bigquery_credentials(profile_credentials)
+        with catchtime("get bigquery credentials"):
+            if profile_credentials.impersonate_service_account:
+                creds = cls.get_impersonated_bigquery_credentials(profile_credentials)
+            else:
+                creds = cls.get_bigquery_credentials(profile_credentials)
         execution_project = profile_credentials.execution_project
         location = getattr(profile_credentials, "location", None)
-
-        info = client_info.ClientInfo(user_agent=f"dbt-{dbt_version}")
-        return google.cloud.bigquery.Client(
-            execution_project,
-            creds,
-            location=location,
-            client_info=info,
-        )
+        with catchtime("create bigquery client"):
+            info = client_info.ClientInfo(user_agent=f"dbt-{dbt_version}")
+            client = google.cloud.bigquery.Client(
+                execution_project,
+                creds,
+                location=location,
+                client_info=info,
+            )
+        return client
 
     @classmethod
     def open(cls, connection):
@@ -405,6 +423,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
         job_creation_timeout = self.get_job_creation_timeout_seconds(conn)
         job_execution_timeout = self.get_job_execution_timeout_seconds(conn)
 
+
         def fn():
             return self._query_and_results(
                 client,
@@ -419,7 +438,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
         return query_job, iterator
 
     def execute(
-        self, sql, auto_begin=False, fetch=None
+            self, sql, auto_begin=False, fetch=None
     ) -> Tuple[BigQueryAdapterResponse, agate.Table]:
         sql = self._add_query_comment(sql)
         # auto_begin is ignored on bigquery, and only included for consistency
@@ -572,13 +591,14 @@ class BigQueryConnectionManager(BaseConnectionManager):
         self._retry_and_handle(msg="create dataset", conn=conn, fn=fn)
 
     def _query_and_results(
-        self, client, sql, job_params, job_creation_timeout=None, job_execution_timeout=None
+            self, client, sql, job_params, job_creation_timeout=None, job_execution_timeout=None
     ):
         """Query the client and wait for results."""
         # Cannot reuse job_config if destination is set and ddl is used
         job_config = google.cloud.bigquery.QueryJobConfig(**job_params)
-        query_job = client.query(query=sql, job_config=job_config, timeout=job_creation_timeout)
-        iterator = query_job.result(timeout=job_execution_timeout)
+        with catchtime("execute query"):
+            query_job = client.query(query=sql, job_config=job_config, timeout=job_creation_timeout)
+            iterator = query_job.result(timeout=job_execution_timeout)
 
         return query_job, iterator
 
@@ -645,7 +665,7 @@ def _is_retryable(error):
     if isinstance(error, RETRYABLE_ERRORS):
         return True
     elif isinstance(error, google.api_core.exceptions.Forbidden) and any(
-        e["reason"] == "rateLimitExceeded" for e in error.errors
+            e["reason"] == "rateLimitExceeded" for e in error.errors
     ):
         return True
     return False
